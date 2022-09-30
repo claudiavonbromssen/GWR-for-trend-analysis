@@ -1,0 +1,748 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+To read the associated Excel-files the following function is used. Values below the detection limit are replaced by half of the detection limit (not applicable for TOC), decimal comma is replaced by decimal point.
+
+```{r}
+import_slu_mvm_data_excel <- function(filename, numeric_var = NA, bad_quality_na = TRUE, sheet = 2){ # function for importing excel files into R
+  #numeric var: the first column with measured numeric variables
+  replace_less_than_var <- function(values, bad_quality_na){ # function for replacing values at the detection limit with half values
+    values_parsed <- values %>% as.character() %>% parse_number(locale = locale(decimal_mark = ","))
+
+    which_intervals <- which(substring(values,1,1) == "[")
+    which_less_than <- which(substring(values,1,1) == "<")
+    ## Testa att ersätta alla värden under  högsta detektionsgränsen med halva högsta detektionsgränesn
+    ## Ersätt istället med halva detektionsgränsen, det blir bättre då filerna läses in en och en
+    if (length(which_less_than) > 0) {
+      values_less_than_half <- values[which_less_than] %>% gsub(",", ".", .) %>% gsub("<","",.) %>% as.numeric()
+      values_parsed[which_less_than] <- values_less_than_half/2}
+
+    if (bad_quality_na == TRUE) {values_parsed[which_intervals] <- NA}
+    else{
+      values_intervals <- values[which_intervals] %>%
+        gsub("\\[","", .) %>%
+        gsub("\\]","", .) %>%
+        gsub(",",".", .) %>%
+        as.numeric()
+      values_parsed[which_intervals] <- values_intervals}
+
+    return(values_parsed)
+  }
+
+  if (is.na(numeric_var) == T) {stop("Supply the column index of first measured numeric variable")}
+out <- suppressWarnings(read_excel(filename, sheet = sheet,guess_max = 50000))
+out <-
+  
+  mutate_at(out, c(numeric_var:ncol(out)),
+            replace_less_than_var,
+            bad_quality_na = bad_quality_na)
+out <-
+  mutate_at(out, c(1:(numeric_var - 1)),
+            (function(x) {
+                          x %>%
+                            as.character() %>%
+                            parse_guess(locale = locale(decimal_mark = ","))
+              })
+           )
+
+}
+```
+
+
+Load needed libraries
+```{r}
+library(mgcv)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(janitor)
+library(GWmodel)
+library(knitr)
+library(ape)
+library(ggpubr)
+```
+
+Read data from the SLS, remove lakes situated on Gotland, define year as the year of observation unless the month of observation is January, then the observation is counted for the year before. TOC is log-transformed.
+```{r}
+lakes <- import_slu_mvm_data_excel("SLS.xlsx", numeric_var = 29)
+
+lakes%>%mutate(year1=year(Provdatum), 
+               month=month(Provdatum),
+               log_toc=log10(`TOC (mg/l C)`), 
+               toc=`TOC (mg/l C)`,
+               year=case_when(month==1~year1-1,
+                               TRUE~year1))%>%
+        filter(year!=2007, (`Stationskoordinat N/X`>6445896 | `Stationskoordinat E/Y`<686982.1))%>%
+        clean_names()%>%drop_na(toc)->lakes1
+```
+
+Read coordinates that define the border of Sweden, including the largest lakes.
+```{r}
+border <- read_excel("sverige_smooth_coordinates_SWEREF.xlsx")
+border1<-subset(border, namn=="sverige", select=c(East_SWERE, North_SWER))
+border_vänern<-subset(border, namn=="vänern", select=c(East_SWERE, North_SWER))
+border_vättern<-subset(border, namn=="vättern", select=c(East_SWERE, North_SWER))
+border_mälaren<-subset(border, namn=="mälaren", select=c(East_SWERE, North_SWER))
+
+```
+
+
+Set unique IDs for all lakes. If present the national station-ID is used, otherwise the MVM-ID.
+```{r}
+
+#Obtain nationellt_overvakningsstations_id from koordinates
+lakes1%>%dplyr::select(stationskoordinat_e_y, stationskoordinat_n_x, nationellt_overvakningsstations_id)%>%
+  group_by(stationskoordinat_n_x, stationskoordinat_e_y)%>%distinct()%>%
+  slice(1)%>%filter(!is.na(nationellt_overvakningsstations_id))%>%
+  rename(new_ovv=nationellt_overvakningsstations_id)->stations1
+
+#Join with original dataset to get the same ID for same koordinates
+lakes1%>%select(-nationellt_overvakningsstations_id)%>%left_join(stations1)%>%
+  mutate(ID=new_ovv)->lakes_a1
+
+#Obtain mvm_id from koordinates
+lakes_a1%>%dplyr::select(stationskoordinat_e_y, stationskoordinat_n_x, md_mvm_id)%>%
+  group_by(stationskoordinat_n_x, stationskoordinat_e_y)%>%distinct()%>%slice(1)%>%
+  filter(!is.na(md_mvm_id))%>%
+  rename(new_ovv=md_mvm_id)->stations2
+
+#Join with dataset to fill ID for stations that do not have a national ID
+lakes_a1%>% select(-new_ovv)%>%left_join(stations2)%>%
+mutate(ID=case_when(is.na(ID)~as.character(new_ovv),
+                      TRUE~ID))->lakes_a
+
+
+```
+Identify stations with only a single observations and remove them.
+```{r}
+lakes_a%>%group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x)%>%
+  mutate(n=n())%>%filter(n<=1)%>%arrange(ID)%>%
+  dplyr::select( stationskoordinat_e_y, stationskoordinat_n_x, overvakningsstation, ID)->only_single
+
+lakes_a%>%filter(!ID %in% only_single$ID) ->lakes2
+```
+
+Compute mean value, variances and coefficient of variation 
+```{r}
+lakes2%>%group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x)%>%summarize(var_log_toc=var(log_toc),sd_log_toc=sd(log_toc), mean_log_toc=mean(log_toc),var_toc=var(toc), mean_toc=mean(toc), cv_toc=var_toc/mean_toc, cv_log=sqrt(exp((sd_log_toc*log(10))^2)-1))->var_data
+```
+
+Figure 2, left: Plot of mean TOC in Sweden.
+```{r}
+var_data%>%ggplot( aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "lightgray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=mean_toc))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="lemonchiffon", high = "darkgreen", midpoint=0, space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="Mean of TOC"))+
+  theme_bw()+
+  ylab("")+
+  xlab("")
+```
+
+Figure 2, right: Plot of coefficient of variation
+```{r}
+var_data%>%arrange(cv_log)%>%ggplot( aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_point(aes(colour=cv_log))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "white",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=cv_log,size=2))+
+  geom_point(data=var_data%>%filter(cv_log>0.8), aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="white", high = "darkred", space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="CV"))+
+  scale_size(guide = 'none')+
+  theme_bw()+
+  ylab("")+
+  xlab("")
+```
+
+Identify lakes with high coefficient of variation. Save information for table S1.
+```{r}
+var_data%>%filter(cv_log>0.8)%>%mutate(ind=1)->high_cv
+
+lakes2%>%left_join(high_cv)%>%filter(ID %in% high_cv$ID)%>%
+  dplyr::select(overvakningsstation, ID, stationskoordinat_e_y, stationskoordinat_n_x, toc, log_toc, var_toc, cv_toc, cv_log, year, md_mvm_id, ind) ->high_var_lakes
+
+
+high_var_lakes%>%
+  dplyr::select(ID, overvakningsstation, stationskoordinat_e_y, stationskoordinat_n_x, year, toc, cv_log)%>%arrange(desc(stationskoordinat_n_x))%>%mutate_at(c("toc", "cv_log"), round, 2)->info_to_table
+
+
+#write.table(info_to_table, file = "high_var_lakes_toc.txt", sep = ",", quote = FALSE, row.names = F)
+```
+
+
+
+The station-wise mean-centered TOC variable is computed. Intercept should be the overall mean (i.e. close to zero), i.e. the variable year is centered. 
+```{r}
+
+lakes2%>% group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x)%>%summarize(sd_toc=sd(log_toc), mean_toc=mean(log_toc))->lakes_sd
+
+lakes2%>%
+  left_join(lakes_sd)%>%mutate(cent_toc=log_toc-mean_toc,
+         cyear=year-2014)->lakes3
+```
+
+Compute Moran's I for the stationwise change
+```{r}
+lakes3%>%group_by(ID)%>%arrange(year)%>%slice_head()%>%select(ID, cent_toc, year, stationskoordinat_e_y, stationskoordinat_n_x)->first
+lakes3%>%group_by(ID)%>%arrange(year)%>%slice_tail()%>%select(ID, cent_toc, year, stationskoordinat_e_y, stationskoordinat_n_x)->last
+
+first%>%left_join(last, by=c("ID"))%>%mutate(change_year=(cent_toc.y-cent_toc.x)/(year.y-year.x))->joint
+
+
+toc.dists <- as.matrix(dist(cbind(joint$stationskoordinat_e_y.x, joint$stationskoordinat_n_x.x)))
+
+toc.dists.inv <- 1/toc.dists
+diag(toc.dists.inv) <- 0
+ 
+Moran.I(joint$change_year, toc.dists.inv)
+```
+
+Bandwidth search for mean-centered data. This is only run once with a result of 382. Takes time to run.
+```{r}
+# 
+# lakes.spdf <- SpatialPointsDataFrame(lakes3[, c(5,4)], lakes3)
+# bw<-bw.gwr(cent_toc ~ cyear,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes.spdf)
+```
+
+
+
+
+Main model for TOC, computed on mean-centered TOC with the cross-validated knn (382).
+```{r}
+lakes.spdf <- SpatialPointsDataFrame(lakes3[, c(5,4)], lakes3)
+model_toc_382<-gwr.basic(cent_toc ~ cyear,bw=382,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes.spdf)
+
+pval_toc_382<-gwr.t.adjust(model_toc_382)
+```
+
+Model for non-centered TOC for comparison, cross-validated knn is 23.
+```{r}
+#bw<-bw.gwr(log_toc ~ cyear,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes.spdf)
+model_toc_23_noncent<-gwr.basic(log_toc ~ cyear,bw=23,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes.spdf)
+
+pval_toc_23_noncent<-gwr.t.adjust(model_toc_23_noncent)
+```
+
+Model excluding stations with a CV larger than 0.8
+```{r}
+var_data%>%filter(cv_log>0.8)%>%mutate(ind=1)->high_cv2
+lakes3%>%filter(!ID %in% high_cv2$ID)->lakes_08
+lakes_08.spdf <- SpatialPointsDataFrame(lakes_08[, c(5,4)], lakes_08)
+
+
+model_toc_08<-gwr.basic(cent_toc ~ cyear,bw=382,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes_08.spdf)
+
+pval_toc_08<-gwr.t.adjust(model_toc_08)
+```
+
+Using a smaller kernel size knn=90 for comparison.
+```{r}
+model_toc_90<-gwr.basic(cent_toc ~ cyear,bw=90,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes.spdf)
+
+pval_toc_90<-gwr.t.adjust(model_toc_90)
+```
+
+
+
+
+Figure 3, left: trend slope coefficients for the main model
+```{r}
+ggplot(lakes3, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model_toc_382$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+
+```
+
+Figure 3, right: Significant trends for the main model
+```{r}
+lakes3%>%mutate(pval0=case_when(pval_toc_382$SDF$cyear_p<0.05 & model_toc_382$SDF$cyear>0~1,
+                              pval_toc_382$SDF$cyear_p<0.05 & model_toc_382$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_toc_382
+
+
+ggplot(lakes_p_toc_382, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "gray", "red"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+```
+
+Slope coefficient for the noncentered data
+```{r}
+ggplot(lakes3, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model_toc_23_noncent$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+Significant trends in model with noncentered data for comparison.
+```{r}
+lakes3%>%mutate(pval0=case_when(pval_toc_23_noncent$SDF$cyear_p<0.05 & model_toc_23_noncent$SDF$cyear>0~1,
+                              pval_toc_23_noncent$SDF$cyear_p<0.05 & model_toc_23_noncent$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_noncent
+
+ggplot(lakes_p_noncent, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+    geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  scale_colour_manual(values=c("blue", "gray", "red"))+
+  theme_classic()+
+   theme(legend.position="None")+
+    ylab("")+
+  xlab("")
+```
+
+Significant trends if stations with CV(log) over 0.8 are removed.
+```{r}
+lakes_08%>%mutate(pval0=case_when(pval_toc_08$SDF$cyear_p<0.05 & model_toc_08$SDF$cyear>0~1,
+                              pval_toc_08$SDF$cyear_p<0.05 & model_toc_08$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p08
+
+ggplot(lakes_p08, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+    geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  scale_colour_manual(values=c("blue", "gray", "red"))+
+  theme_classic()+
+   theme(legend.position="None")+
+    ylab("")+
+  xlab("")
+```
+
+Determine for which stations the significance of trends changes
+```{r}
+lakes3%>%mutate(coef_all=model_toc_382$SDF$cyear,
+                pval_all=pval_toc_382$SDF$cyear_p)->lakes_all
+
+lakes_08%>%mutate(coef_08=model_toc_08$SDF$cyear, pval_08=pval_toc_08$SDF$cyear_p)%>%full_join(lakes_all, by=c("ID","year"))%>%
+  mutate(est_diff=coef_08-coef_all)%>%
+  arrange(desc(abs(est_diff)))%>%
+  select(ID, overvakningsstation.x,est_diff, log_toc.x, year, coef_all, coef_08, stationskoordinat_e_y.x, stationskoordinat_n_x.x)->diffs
+```
+
+
+Figure S1: Changes in significant trends when stations with high coefficient of variation are removed
+```{r}
+diffs%>%group_by(ID)%>%slice(1)%>%ungroup()%>%
+  mutate(ind=case_when(est_diff>0.001 & coef_08>0~"increased positive",
+                          est_diff>0.001 & coef_08<0~"decreased negative",
+                          est_diff< -0.001 & coef_08>0~"decreased positive",
+                          est_diff< -0.001 & coef_08<0 ~"increased negative",
+                          est_diff== 0~"no change",
+                          coef_08==0~"coef_08 0"))->diffs1
+
+ggplot(diffs1, aes(x=stationskoordinat_e_y.x,y=stationskoordinat_n_x.x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=ind))+
+  scale_color_manual(values = c("increased positive" = "red",
+                                "increased negative"="blue",
+                                "decreased positive"="orange",
+                                "decreased negative"="turquoise"),
+                     labels = c("increased positive", "increased negative", "decreased positive", "decreased negative"),
+                     name="Change", na.value="gray80")+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+Differences in slope coefficients if stations with high coefficient of variation are removed.
+```{r}
+ggplot(diffs, aes(x=stationskoordinat_e_y.x,y=stationskoordinat_n_x.x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=est_diff))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="blue",mid="white", high = "red", midpoint=0, space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="Difference in slope"))+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+Figure 4, left: slope coefficient for the model with knn=90
+```{r}
+ggplot(lakes3, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model_toc_90$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, limits=c(-0.038, 0.038), space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+Figure 4, right: Significant trends for the model with knn=90
+
+```{r}
+lakes_all%>%mutate(pval0=case_when(pval_toc_90$SDF$cyear_p<0.05 & model_toc_90$SDF$cyear>0~1,
+                              pval_toc_90$SDF$cyear_p<0.05 & model_toc_90$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_toc_90
+
+
+
+ggplot(lakes_p_toc_90, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "gray", "red"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+```
+
+
+```{r}
+
+lakes_2008<-lakes3%>%filter(year<=2017)
+lakes_2009<-lakes3%>%filter(year<=2018 & year>=2009)
+lakes_2010<-lakes3%>%filter(year<=2019 & year>=2010)
+lakes_2011<-lakes3%>%filter(year<=2020 & year>=2011)
+lakes_2012<-lakes3%>%filter(year>=2012)
+
+lakes2008.spdf <- SpatialPointsDataFrame(lakes_2008[, c(5,4)], lakes_2008)
+lakes2009.spdf <- SpatialPointsDataFrame(lakes_2009[, c(5,4)], lakes_2009)
+lakes2010.spdf <- SpatialPointsDataFrame(lakes_2010[, c(5,4)], lakes_2010)
+lakes2011.spdf <- SpatialPointsDataFrame(lakes_2011[, c(5,4)], lakes_2011)
+lakes2012.spdf <- SpatialPointsDataFrame(lakes_2012[, c(5,4)], lakes_2012)
+
+
+model2008<-gwr.basic(cent_toc ~ cyear,bw=45,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2008.spdf)
+model2009<-gwr.basic(cent_toc ~ cyear,bw=45,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2009.spdf)
+model2010<-gwr.basic(cent_toc ~ cyear,bw=45,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2010.spdf)
+model2011<-gwr.basic(cent_toc ~ cyear,bw=45,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2011.spdf)
+model2012<-gwr.basic(cent_toc ~ cyear,bw=45,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2012.spdf)
+
+pval_2008<-gwr.t.adjust(model2008)
+pval_2009<-gwr.t.adjust(model2009)
+pval_2010<-gwr.t.adjust(model2010)
+pval_2011<-gwr.t.adjust(model2011)
+pval_2012<-gwr.t.adjust(model2012)
+
+
+
+#bw2008<-bw.gwr(log_toc ~ cyear,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2008.spdf)
+#bw2012<-bw.gwr(log_toc ~ cyear,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes2012.spdf)
+```
+
+
+```{r}
+
+gwr.point_2008<-ggplot(lakes_2008, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model2008$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+gwr.point_2009<-ggplot(lakes_2009, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model2009$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+
+gwr.point_2010<-ggplot(lakes_2010, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model2010$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+gwr.point_2011<-ggplot(lakes_2011, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model2011$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+
+gwr.point_2012<-ggplot(lakes_2012, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model2012$SDF$cyear))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, space = "rgb", limits=c(-0.038, 0.038), na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+```
+
+
+```{r}
+ggarrange(gwr.point_2008,gwr.point_2009, gwr.point_2010, gwr.point_2011, gwr.point_2012, ncol=5, nrow=1, labels = c("2008-2017","2009-2018", "2010-2019", "2011-2020","2012-2021"),hjust=c(-1,-1,-1, -1), common.legend = TRUE, legend="none" )
+```
+
+```{r}
+lakes_2008%>%mutate(pval0=case_when(pval_2008$SDF$cyear_p<0.05 & model2008$SDF$cyear>0~1,
+                              pval_2008$SDF$cyear_p<0.05 & model2008$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_2008
+
+gwr.point_p_2008<-ggplot(lakes_p_2008, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "grey", "red"), labels=c("decreasing","none", "increasing"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+lakes_2009%>%mutate(pval0=case_when(pval_2009$SDF$cyear_p<0.05 & model2009$SDF$cyear>0~1,
+                              pval_2009$SDF$cyear_p<0.05 & model2009$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_2009
+
+
+gwr.point_p_2009<-ggplot(lakes_p_2009, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "grey", "red"), labels=c("decreasing","none", "increasing"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+lakes_2010%>%mutate(pval0=case_when(pval_2010$SDF$cyear_p<0.05 & model2010$SDF$cyear>0~1,
+                              pval_2010$SDF$cyear_p<0.05 & model2010$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_2010
+
+gwr.point_p_2010<-ggplot(lakes_p_2010, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "grey", "red"), labels=c("decreasing","none", "increasing"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+
+
+lakes_2011%>%mutate(pval0=case_when(pval_2011$SDF$cyear_p<0.05 & model2011$SDF$cyear>0~1,
+                              pval_2011$SDF$cyear_p<0.05 & model2011$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_2011
+
+gwr.point_p_2011<-ggplot(lakes_p_2011, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "grey", "red"), labels=c("decreasing","none", "increasing"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+
+
+lakes_2012%>%mutate(pval0=case_when(pval_2012$SDF$cyear_p<0.05 & model2012$SDF$cyear>0~1,
+                              pval_2012$SDF$cyear_p<0.05 & model2012$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_2012
+
+gwr.point_p_2012<-ggplot(lakes_p_2012, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_manual(values=c("blue", "grey", "red"), labels=c("decreasing","none", "increasing"))+
+  theme_classic()+
+  theme(legend.position="None")+
+  ylab("")+
+  xlab("")
+```
+
+```{r}
+
+ggarrange(gwr.point_p_2008,gwr.point_p_2009, gwr.point_p_2010, gwr.point_p_2011, gwr.point_p_2012, ncol=5, nrow=1, labels = c("2008-2017","2009-2018", "2010-2019", "2011-2020","2012-2021"),hjust=c(-1,-1,-1, -1), common.legend = TRUE, legend="none" )
+```
+

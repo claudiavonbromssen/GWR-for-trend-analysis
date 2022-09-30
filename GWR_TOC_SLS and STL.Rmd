@@ -1,0 +1,505 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+STationer byter mvm-id och SO4 byter till SO4_IC. behöver bearbetas innan analysen kan göras.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+To read the associated Excel-files the following function is used. Values below the detection limit are replaced by half of the detection limit (not applicable for TOC), decimal comma is replaced by decimal point.
+
+```{r}
+import_slu_mvm_data_excel <- function(filename, numeric_var = NA, bad_quality_na = TRUE, sheet = 2){ # function for importing excel files into R
+  #numeric var: the first column with measured numeric variables
+  replace_less_than_var <- function(values, bad_quality_na){ # function for replacing values at the detection limit with half values
+    values_parsed <- values %>% as.character() %>% parse_number(locale = locale(decimal_mark = ","))
+
+    which_intervals <- which(substring(values,1,1) == "[")
+    which_less_than <- which(substring(values,1,1) == "<")
+    ## Testa att ersätta alla värden under  högsta detektionsgränsen med halva högsta detektionsgränesn
+    ## Ersätt istället med halva detektionsgränsen, det blir bättre då filerna läses in en och en
+    if (length(which_less_than) > 0) {
+      values_less_than_half <- values[which_less_than] %>% gsub(",", ".", .) %>% gsub("<","",.) %>% as.numeric()
+      values_parsed[which_less_than] <- values_less_than_half/2}
+
+    if (bad_quality_na == TRUE) {values_parsed[which_intervals] <- NA}
+    else{
+      values_intervals <- values[which_intervals] %>%
+        gsub("\\[","", .) %>%
+        gsub("\\]","", .) %>%
+        gsub(",",".", .) %>%
+        as.numeric()
+      values_parsed[which_intervals] <- values_intervals}
+
+    return(values_parsed)
+  }
+
+  if (is.na(numeric_var) == T) {stop("Supply the column index of first measured numeric variable")}
+out <- suppressWarnings(read_excel(filename, sheet = sheet,guess_max = 50000))
+out <-
+  
+  mutate_at(out, c(numeric_var:ncol(out)),
+            replace_less_than_var,
+            bad_quality_na = bad_quality_na)
+out <-
+  mutate_at(out, c(1:(numeric_var - 1)),
+            (function(x) {
+                          x %>%
+                            as.character() %>%
+                            parse_guess(locale = locale(decimal_mark = ","))
+              })
+           )
+
+}
+```
+
+
+Load needed libraries
+```{r}
+library(mgcv)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(janitor)
+library(GWmodel)
+library(knitr)
+library(ape)
+```
+
+Read data from the SLS, remove lakes situated on Gotland, define year as the year of observation unless the month of observation is January, then the observation is counted for the year before. TOC is log-transformed. Include a variable to identify these lakes as SLS lakes
+```{r}
+lakes <- import_slu_mvm_data_excel("SLS.xlsx", numeric_var = 29)
+
+lakes%>%mutate(year1=year(Provdatum), 
+               month=month(Provdatum),
+               log_toc=log10(`TOC (mg/l C)`), 
+               toc=`TOC (mg/l C)`,
+               year=case_when(month==1~year1-1,
+                              TRUE~year1),
+               SLS=1)%>%
+  filter(year!=2007,(`Stationskoordinat N/X`>6445896 | `Stationskoordinat E/Y`<686982.1))%>%
+  clean_names()%>%drop_na(toc)->lakes1
+```
+
+Read data from the STL, remove lakes situated on Gotland,extract observations from September to November. TOC is log-transformed.Compute means in case there are several observations per station and year. This file contains data from 2012 to 2021.
+```{r}
+trendlakes<- import_slu_mvm_data_excel("STL2012-2021.xlsx", numeric_var = 26)%>%
+  clean_names()%>%
+  filter(provtagningsmanad>8 & provtagningsmanad <12 & provtagningsar>=2007, (stationskoordinat_n_x>6445896 | stationskoordinat_e_y<686982.1), max_provdjup_m<=1)%>%
+  mutate(year=provtagningsar, log_toc=log10(toc_mg_l_c), sls=0)%>%
+  group_by(nationellt_overvakningsstations_id, stationskoordinat_e_y, stationskoordinat_n_x, overvakningsstation,  year, sls)%>%
+  summarize(mlog_toc=mean(log_toc, na.rm=TRUE), mtoc=mean(toc_mg_l_c, na.rm=TRUE))%>%rename(log_toc=mlog_toc, toc=mtoc, ID=nationellt_overvakningsstations_id)
+```
+
+Read a similar file with data before 2012.
+```{r}
+trendlakes2<- import_slu_mvm_data_excel("STL2007-2011.xlsx", numeric_var = 26)%>%
+  clean_names()%>%
+  filter(provtagningsmanad>8 & provtagningsmanad <12 & provtagningsar>2007, ( stationskoordinat_n_x>6445896 | stationskoordinat_e_y<686982.1), max_provdjup_m<=1)%>%
+  mutate(year=provtagningsar, log_toc=log10(toc_mg_l_c), sls=0)%>%
+  group_by(nationellt_overvakningsstations_id, stationskoordinat_e_y, stationskoordinat_n_x, overvakningsstation,  year, sls)%>%
+  summarize(mlog_toc=mean(log_toc, na.rm=TRUE), mtoc=mean(toc_mg_l_c, na.rm=TRUE))%>%rename(log_toc=mlog_toc, toc=mtoc, ID=nationellt_overvakningsstations_id)
+
+
+```
+
+Read coordinates that define the border of Sweden, including the largest lakes.
+```{r}
+border <- read_excel("sverige_smooth_coordinates_SWEREF.xlsx")
+border1<-subset(border, namn=="sverige", select=c(East_SWERE, North_SWER))
+border_vänern<-subset(border, namn=="vänern", select=c(East_SWERE, North_SWER))
+border_vättern<-subset(border, namn=="vättern", select=c(East_SWERE, North_SWER))
+border_mälaren<-subset(border, namn=="mälaren", select=c(East_SWERE, North_SWER))
+
+```
+
+
+Set unique IDs for all lakes in the SLS. If present the national station-ID is used, otherwise the MVM-ID.
+```{r}
+
+#Obtain nationellt_overvakningsstations_id from koordinates
+lakes1%>%dplyr::select(stationskoordinat_e_y, stationskoordinat_n_x, nationellt_overvakningsstations_id)%>%group_by(stationskoordinat_n_x, stationskoordinat_e_y)%>%distinct()%>%slice(1)%>%filter(!is.na(nationellt_overvakningsstations_id))%>%
+  rename(new_ovv=nationellt_overvakningsstations_id)->stations1
+
+#Join with original dataset to get the same ID for same koordinates
+lakes1%>%select(-nationellt_overvakningsstations_id)%>%left_join(stations1)%>%
+  mutate(ID=new_ovv)->lakes_a1
+
+#Obtain mvm_id from koordinates
+lakes_a1%>%dplyr::select(stationskoordinat_e_y, stationskoordinat_n_x, md_mvm_id)%>%group_by(stationskoordinat_n_x, stationskoordinat_e_y)%>%distinct()%>%slice(1)%>%filter(!is.na(md_mvm_id))%>%
+  rename(new_ovv=md_mvm_id)->stations2
+
+#Join with dataset to fill ID for stations that do not have a national ID
+lakes_a1%>% select(-new_ovv)%>%left_join(stations2)%>%
+mutate(ID=case_when(is.na(ID)~as.character(new_ovv),
+                      TRUE~ID))->lakes_a
+
+
+```
+Identify stations with only a single observations and remove them
+```{r}
+lakes_a%>%group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x)%>% mutate(n=n())%>%filter(n<=1)%>%arrange(ID)%>%
+  dplyr::select( stationskoordinat_e_y, stationskoordinat_n_x, overvakningsstation, ID)->only_single
+
+
+lakes_a%>%filter(!ID %in% only_single$ID) ->lakes2
+```
+
+Merge SLS and STL data
+```{r}
+lakes2%>%select(ID, overvakningsstation, stationskoordinat_e_y, stationskoordinat_n_x,  year, sls, log_toc, toc)%>%
+  full_join(trendlakes)%>%
+  full_join(trendlakes2) ->lakes_joint
+
+```
+
+The station-wise mean-centered TOC variable is computed. Intercept should be the overall mean (i.e. close to zero), i.e. the variable year is centered. 
+Create a dataset with all data and one that only contains SLS data, 
+
+```{r}
+lakes_joint%>% group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x)%>%
+  summarize(sd_toc=sd(log_toc), mean_toc=mean(log_toc, na.rm=TRUE))->lakes_sd
+
+lakes_joint%>%
+  left_join(lakes_sd)%>%
+  mutate(cent_toc=log_toc-mean_toc, 
+         cyear=year-2014)%>%
+  drop_na(log_toc)->lakes_all
+
+lakes_all%>%filter(sls==1)->lakes_SLS
+
+```
+
+
+Bandwidth search. Takes time, gives 400.
+```{r}
+#lakes_all.spdf <- SpatialPointsDataFrame(lakes_all[, c(3,4)], lakes_all)
+#bw<-bw.gwr(cent_toc ~ cyear,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes_all.spdf)
+```
+
+Model for the combined dataset.
+```{r}
+lakes_all.spdf <- SpatialPointsDataFrame(lakes_all[, c(3,4)], lakes_all)
+model_toc_SLS_and_STL<-gwr.basic(cent_toc ~ cyear,bw=400,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes_all.spdf)
+
+pval_toc_SLS_and_STL<-gwr.t.adjust(model_toc_SLS_and_STL)
+
+
+```
+
+Figure 5, left: Slope coefficients from the model based on both the SLS and STL
+```{r}
+ggplot(lakes_all, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+     geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=model_toc_SLS_and_STL$SDF$cyear))+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  scale_colour_gradient2(low ="darkblue",mid="white", high = "darkred", midpoint=0, limits=c(-0.038, 0.038), space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="Linear trend slope"))+
+  theme_classic()+
+    ylab("")+
+  xlab("")
+```
+
+Significant trends for model based on both the SLS and STL
+```{r}
+lakes_all%>%mutate(pval0=case_when(pval_toc_SLS_and_STL$SDF$cyear_p<0.05 & model_toc_SLS_and_STL$SDF$cyear>0~1,
+                              pval_toc_SLS_and_STL$SDF$cyear_p<0.05 & model_toc_SLS_and_STL$SDF$cyear<0 ~-1,
+                              TRUE~0))%>%
+  group_by(stationskoordinat_e_y, stationskoordinat_n_x)%>%slice(1)->lakes_p_all
+
+
+
+ggplot(lakes_p_all, aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  
+    geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=as.factor(pval0)))+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+    geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  scale_colour_manual(values=c("blue", "gray", "red"))+
+  theme_classic()+
+   theme(legend.position="None")+
+    ylab("")+
+  xlab("")
+```
+
+
+Differences in results
+Run model for only SLS 
+```{r}
+
+lakes_SLS.spdf <- SpatialPointsDataFrame(lakes_SLS[, c(3,4)], lakes_SLS)
+
+model_toc_SLS<-gwr.basic(cent_toc ~ cyear,bw=382,adaptive=TRUE,kernel="bisquare", parallel.method=TRUE,data=lakes_SLS.spdf)
+
+pval_toc_SLS<-gwr.t.adjust(model_toc_SLS)
+
+
+```
+
+
+
+Differences in slopes between models
+```{r}
+lakes_all%>%mutate(coef_all=model_toc_SLS_and_STL$SDF$cyear,
+                pval_all=pval_toc_SLS_and_STL$SDF$cyear_p)->lakes_all1
+
+lakes_SLS%>%mutate(coef_SLS=model_toc_SLS$SDF$cyear,
+                  pval_SLS=pval_toc_SLS$SDF$cyear_p)%>%right_join(lakes_all1, by=c("ID","year"))%>%
+  mutate(est_diff=coef_all-coef_SLS)%>%
+  arrange(desc(abs(est_diff)))%>%
+  select(ID, overvakningsstation.x,sls.x, sls.y, est_diff, log_toc.x, year, coef_all, coef_SLS, stationskoordinat_e_y.x, stationskoordinat_n_x.x)->diffs
+```
+
+Figure 5, right: Differences in estimated slope coefficients for the model using SLS and STL compared to SLS only.
+```{r}
+ggplot(diffs, aes(x=stationskoordinat_e_y.x,y=stationskoordinat_n_x.x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  # geom_polygon(data = border_gotland,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+    geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=est_diff))+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+ # geom_path(data = border_gotland,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  scale_colour_gradient2(low ="blue",mid="white", high = "red", midpoint=0, space = "rgb", na.value = "grey50", guide = "colourbar", guide_legend(title="Difference in slope"))+
+  geom_point(data=lakes_all%>%filter(sls==0), aes(x=stationskoordinat_e_y, y=stationskoordinat_n_x), col="black", lwd=1)+
+  theme_classic()+
+    ylab("")+
+  xlab("")
+```
+
+
+
+Figure S2: Differences in significance for models based on SLS and STL compared to SLS only
+```{r}
+diffs%>%group_by(ID)%>%slice(1)%>%ungroup()%>%mutate(ind=case_when(est_diff>0.001 & coef_SLS>0~"increased positive",
+                          est_diff>0.001 & coef_SLS<0~"decreased negative",
+                          est_diff< -0.001 & coef_SLS>0~"decreased positive",
+                          est_diff< -0.001 & coef_SLS<0 ~"increased negative",
+                          est_diff== 0~"no change",
+                          coef_SLS==0~"coefSLS 0"))->diffs1
+
+ggplot(diffs1, aes(x=stationskoordinat_e_y.x,y=stationskoordinat_n_x.x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+    geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+    geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=ind))+
+  scale_color_manual(values = c("increased positive" = "red",
+                                "increased negative"="blue",
+                                "decreased positive"="orange",
+                                "decreased negative"="turquoise"),
+                     labels = c("increased positive", "increased negative", "decreased positive", "decreased negative"),
+                     name="Change", na.value="gray80")+
+    geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+   geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+   coord_fixed()+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+Comparision of trends in SLS and STL for specific identified areas
+
+Figure 6, upper left: Lake Kupesjön
+```{r}
+distance<-lakes_all%>%mutate(dist=(stationskoordinat_e_y-450408)^2 +(stationskoordinat_n_x-6331514)^2)%>%group_by(ID)%>%slice(1)%>%ungroup()%>%arrange(dist)%>%slice(30)
+
+lakes_all%>%mutate(dist=(stationskoordinat_e_y-450408)^2 +(stationskoordinat_n_x-6331514)^2)%>%filter(dist <= distance$dist & sls==1)%>%
+  mutate(ID_new=paste(ID, sls))%>%
+  ggplot()+
+  geom_point(aes(x=year, y=log_toc), col="gray40")+
+  geom_line(aes(x=year, y=log_toc, group=ID), col="gray40")+
+  theme(legend.position = "none")+
+  geom_line(data=lakes_all%>%mutate(dist=(stationskoordinat_e_y-450408)^2 +(stationskoordinat_n_x-6331514)^2)%>%filter(dist <= distance$dist & sls==0),
+             aes(x=year, y=log_toc, group=overvakningsstation, lty=overvakningsstation), lwd=1.1) +
+  theme_classic()+
+  ylab("TOC (log-transformed)")+
+  xlab("Year")+
+  theme(legend.position="bottom")+
+  theme(text= element_text(size=16))+
+  guides(linetype=guide_legend(title="Station"))
+
+```
+figure 6, upper right: Älvasjön
+```{r}
+distance<-lakes_all%>%mutate(dist=(stationskoordinat_e_y-384420)^2 +(stationskoordinat_n_x-6284776)^2)%>%group_by(ID)%>%slice(1)%>%ungroup()%>%arrange(dist)%>%slice(30)
+
+
+lakes_all%>%mutate(dist=(stationskoordinat_e_y-384420)^2 +(stationskoordinat_n_x-6284776)^2)%>%filter(dist <= distance$dist & sls==1)%>%
+  mutate(ID_new=paste(ID, sls))%>%
+  ggplot()+
+  geom_point(aes(x=year, y=log_toc), col="gray40")+
+  geom_line(aes(x=year, y=log_toc, group=ID), col="gray40")+
+  theme(legend.position = "none")+
+  geom_line(data=lakes_all%>%mutate(dist=(stationskoordinat_e_y-384420)^2 +(stationskoordinat_n_x-6284776)^2)%>%filter(dist <= distance$dist & sls==0),
+             aes(x=year, y=log_toc, group=overvakningsstation, lty=overvakningsstation), lwd=1.1) +
+  theme_classic()+
+  ylab("TOC (log-transformed)")+
+  xlab("Year")+
+  theme(legend.position="bottom")+
+  theme(text= element_text(size=16))+
+  guides(linetype=guide_legend(title="Station"))
+```
+
+
+Figure 6, lower left: Norasjön
+```{r}
+
+distance<-lakes_all%>%mutate(dist=(stationskoordinat_e_y-647006)^2 +(stationskoordinat_n_x-6538408)^2)%>%group_by(ID)%>%slice(1)%>%ungroup()%>%arrange(dist)%>%slice(30)
+
+lakes_all%>%mutate(dist=(stationskoordinat_e_y-647006)^2 +(stationskoordinat_n_x-6538408)^2)%>%filter(dist <= distance$dist & sls==1)%>%
+  mutate(ID_new=paste(ID, sls))%>%
+  ggplot()+
+  geom_point(aes(x=year, y=log_toc), col="gray40")+
+  geom_line(aes(x=year, y=log_toc, group=ID), col="gray40")+
+  theme(legend.position = "none")+
+  geom_line(data=lakes_all%>%mutate(dist=(stationskoordinat_e_y-647006)^2 +(stationskoordinat_n_x-6538408)^2)%>%filter(dist <= distance$dist & sls==0),
+             aes(x=year, y=log_toc, group=overvakningsstation, lty=overvakningsstation), lwd=1.1) +
+  theme_classic()+
+  ylab("TOC (log-transformed)")+
+  xlab("Year")+
+  theme(legend.position="bottom")+
+  theme(text= element_text(size=16))+
+  guides(linetype=guide_legend(title="Station"))
+
+```
+
+
+Figure 6, lower right: Outside Karlshamn
+```{r}
+distance<-lakes_all%>%mutate(dist=(stationskoordinat_e_y-496102)^2 +(stationskoordinat_n_x-6225833)^2)%>%group_by(ID)%>%slice(1)%>%ungroup()%>%arrange(dist)%>%slice(30)
+
+
+lakes_all%>%mutate(dist=(stationskoordinat_e_y-496102)^2 +(stationskoordinat_n_x-6225833)^2)%>%filter(dist <= distance$dist & sls==1)%>%
+  mutate(ID_new=paste(ID, sls))%>%
+  ggplot()+
+  geom_point(aes(x=year, y=log_toc), col="gray40")+
+  geom_line(aes(x=year, y=log_toc, group=ID), col="gray40")+
+  theme(legend.position = "none")+
+  geom_line(data=lakes_all%>%mutate(dist=(stationskoordinat_e_y-496102)^2 +(stationskoordinat_n_x-6225833)^2)%>%filter(dist <= distance$dist & sls==0),
+             aes(x=year, y=log_toc, group=overvakningsstation, lty=overvakningsstation), lwd=1.1) +
+  theme_classic()+
+  ylab("TOC (log-transformed)")+
+  xlab("Year")+
+  theme(legend.position="bottom")+
+  theme(text= element_text(size=16))+
+  guides(linetype=guide_legend(title="Station"))
+```
+Area between Vänern and Vättern.
+```{r}
+distance<-lakes_all%>%mutate(dist=(stationskoordinat_e_y-416952)^2 +(stationskoordinat_n_x-6479250)^2)%>%group_by(ID)%>%slice(1)%>%ungroup()%>%arrange(dist)%>%slice(30)
+
+
+lakes_all%>%mutate(dist=(stationskoordinat_e_y-416952)^2 +(stationskoordinat_n_x-6479250)^2)%>%filter(dist <= distance$dist & sls==1)%>%
+  mutate(ID_new=paste(ID, sls))%>%
+  ggplot()+
+  geom_point(aes(x=year, y=log_toc), col="gray40")+
+  geom_line(aes(x=year, y=log_toc, group=ID), col="gray40")+
+  theme(legend.position = "none")+
+  geom_line(data=lakes_all%>%mutate(dist=(stationskoordinat_e_y-416952)^2 +(stationskoordinat_n_x-6479250)^2)%>%filter(dist <= distance$dist & sls==0),
+             aes(x=year, y=log_toc, group=overvakningsstation, lty=overvakningsstation), lwd=1.1) +
+  theme_classic()+
+  ylab("TOC (log-transformed)")+
+  xlab("Year")+
+  theme(legend.position="bottom")+
+  theme(text= element_text(size=16))+
+  guides(linetype=guide_legend(title="Station"))
+```
+
+
+Nonlinear trends for the STL Program usign generalised additive models
+
+
+```{r}
+source("sourcecode_screening2020_dummy2.R")
+```
+
+```{r}
+trendlakes2012<- import_slu_mvm_data_excel("STL2012-2021.xlsx", numeric_var = 26)%>%
+  clean_names()%>%
+  #filter(provtagningsmanad>8 & provtagningsmanad <12 & provtagningsar>=2007)%>%
+  filter(provtagningsar>=2011, max_provdjup_m<=1)%>%
+  mutate(year=provtagningsar, log_toc=log10(toc_mg_l_c), sls=0, month=provtagningsmanad)%>%
+  rename(ID=nationellt_overvakningsstations_id)
+  
+
+trendlakes2008<- import_slu_mvm_data_excel("STL2007-2011.xlsx", numeric_var = 26)%>%
+  clean_names()%>%
+  #filter(provtagningsmanad>8 & provtagningsmanad <12 & provtagningsar>=2007)%>%
+  filter(provtagningsar>=2007, max_provdjup_m<=1)%>%
+  mutate(year=provtagningsar, log_toc=log10(toc_mg_l_c), sls=0, month=provtagningsmanad)%>%
+  rename(ID=nationellt_overvakningsstations_id)
+  
+
+trendlakes_all<-trendlakes2012%>%full_join(trendlakes2008)
+
+```
+
+
+```{r}
+trendlakes_all%>%
+  mutate(overvakningsstation=case_when(overvakningsstation=="Stora Skärsjön" & ID=="00261328"~"Stora Skärsjön 2",
+                                                 overvakningsstation=="Skärgölen" & ID=="00260889"~"Skärgölen 2",
+                                                 TRUE~overvakningsstation),
+                   seas=case_when(month>2 & month <6~2,
+                                  month>5 & month <9~3,
+                                  month>8 & month< 12~4,
+                                  TRUE~1),
+                   date=ymd(make_date(year, month, 1)))%>%
+  drop_na(log_toc)%>%
+  filter(!overvakningsstation %in% c("Älgsjön", "Fräcksjön", "Stora Gryten"), year<2022)->trendlakes_seas
+
+
+trendlakes_seas%>%
+   select(overvakningsstation, 
+         date, 
+         seas,
+         log_toc,
+         )%>%
+  mutate(SiteID=as.factor(overvakningsstation))%>%
+  pivot_longer(cols=c("log_toc")) %>% 
+    screeningmodeling(values=value,
+                    datevar = date, 
+                    seas=seas,
+                    #seasonal = F, 
+                    link = "identity", 
+                    conf.type = "conf",
+                    beep = TRUE, 
+                    tdist = F,
+                    autocor = TRUE,
+                    overvakningsstation,
+                    name) ->
+results 
+```
+
+```{r}
+results%>%left_join(trendlakes_seas%>%group_by(overvakningsstation)%>%slice(1)%>%select(overvakningsstation, stationskoordinat_e_y, stationskoordinat_n_x))->results1
+
+results1 %>%plot_screeningtrends(y_id=overvakningsstation, sorting=desc(stationskoordinat_n_x))
+results1 %>%plot_screeningtrends_pvalues(y_id=overvakningsstation, sorting=desc(stationskoordinat_n_x))
+results%>%filter(overvakningsstation=="Fjärasjö")%>%plot_individual_trend()
+
+```
+
