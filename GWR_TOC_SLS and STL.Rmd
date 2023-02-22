@@ -3,8 +3,6 @@ title: "Untitled"
 output: html_document
 ---
 
-STationer byter mvm-id och SO4 byter till SO4_IC. behöver bearbetas innan analysen kan göras.
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
