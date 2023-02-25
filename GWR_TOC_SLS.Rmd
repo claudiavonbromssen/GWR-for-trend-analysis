@@ -8,6 +8,10 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+#############################################################
+Geographically weighted regression models for the SLS program
+#############################################################
+
 To read the associated Excel-files the following function is used. Values below the detection limit are replaced by half of the detection limit (not applicable for TOC), decimal comma is replaced by decimal point.
 
 ```{r}
