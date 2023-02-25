@@ -6,6 +6,10 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
+####################################
+Combination of SLS and STL programs
+####################################
+
 
 To read the associated Excel-files the following function is used. Values below the detection limit are replaced by half of the detection limit (not applicable for TOC), decimal comma is replaced by decimal point.
 
